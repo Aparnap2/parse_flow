@@ -11,7 +11,8 @@
 		"test:run": "vitest run"
 	},
 	"dependencies": {
-		"@docuflow/shared": "workspace:*"
+		"@docuflow/shared": "workspace:*",
+		"postal-mime": "^2.6.1"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.8.19",

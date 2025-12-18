@@ -26,6 +26,16 @@ app.use('/api/*', cors({
   credentials: true,
 }));
 
+// Environment validation middleware
+app.use(async (c, next) => {
+  // Validate critical environment variables
+  if (!c.env.DATABASE_URL || !c.env.WEBHOOK_SECRET || !c.env.INTERNAL_SECRET) {
+    console.error('Missing required environment variables');
+    return c.text('Server Misconfigured', 500);
+  }
+  await next();
+});
+
 // Rate limiting middleware (would use Cloudflare's built-in rate limiting in production)
 app.use(async (c, next) => {
   // In a real implementation, this would integrate with Cloudflare's rate limiting
@@ -53,21 +63,29 @@ internalRoutes.post('/internal/ingest', async (c) => {
     const body = await c.req.json();
     const { r2Key, originalName, sender } = body;
 
-    // Use sudo to bypass RLS for system ingestion
-    const document = await db.sudo(tx => tx.document.create({
+    // 1. Find or Create User by Sender Email (Auto-Registration for Email Ingest)
+    // In a real app, you might queue this or reject unknown emails.
+    // For MVP, we attach to a specific "System User" or try to find the user.
+    // Ideally, look up user by email:
+    const user = await db.sudo(tx => tx.user.findUnique({ where: { email: sender.address } }));
+    
+    if (!user) {
+        return c.json({ error: "User not found" }, 404);
+    }
+
+    // 2. Create Document
+    const doc = await db.sudo(tx => tx.document.create({
       data: {
-        id: `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Using cuid-like pattern
+        userId: user.id,
         r2Key,
         originalName,
-        status: 'QUEUED',
-        workspaceId: 'default-ws', // For MVP, all docs go to default workspace
-        createdAt: new Date()
+        status: 'QUEUED'
       }
     }));
 
-    return c.json({ 
-      docId: document.id, 
-      workspaceId: document.workspaceId 
+    return c.json({
+      docId: doc.id,
+      workspaceId: user.id // For compatibility, return userId as workspaceId
     });
   } catch (error) {
     console.error('Error creating document record:', error);
@@ -153,6 +171,8 @@ webhookRoutes.post('/webhook/engine', async (c) => {
         vendor: payload.data?.vendor_name,
         total: payload.data?.total_amount,
         date: payload.data?.invoice_date,
+        invoiceNumber: payload.data?.invoice_number,
+        currency: payload.data?.currency,
         driveFileId: payload.drive_file_id,
         error: payload.error
       }
@@ -197,11 +217,12 @@ app.get('/dashboard', async (c) => {
     return c.redirect('/api/auth/signin');
   }
 
-  // Get user's documents using RLS
-  const workspaceId = 'default-ws'; // For MVP, all users get default workspace
-  const docs = await db.withRLS(workspaceId, (tx) =>
-    tx.document.findMany({ 
-      orderBy: { createdAt: 'desc' }, 
+  // Get user's documents using RLS (filter by userId)
+  const userId = session.user.id;
+  const docs = await db.withRLS(userId, (tx) =>
+    tx.document.findMany({
+      where: { userId }, // additional safety
+      orderBy: { createdAt: 'desc' },
       take: 50,
       select: {
         id: true,
@@ -210,6 +231,8 @@ app.get('/dashboard', async (c) => {
         vendor: true,
         total: true,
         date: true,
+        invoiceNumber: true,
+        currency: true,
         driveFileId: true,
         error: true,
         createdAt: true

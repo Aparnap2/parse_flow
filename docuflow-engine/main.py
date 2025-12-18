@@ -1,8 +1,7 @@
 import os
+import logging
 import requests
 import pikepdf
-import img2pdf
-from PIL import Image
 from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from docling.document_converter import DocumentConverter
@@ -10,6 +9,9 @@ from pydantic_ai import Agent
 import tempfile
 import uuid
 
+# Configure Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("docuflow")
 
 app = FastAPI()
 
@@ -34,50 +36,26 @@ class InvoiceData(BaseModel):
 # --- Compression Utilities ---
 def compress_and_standardize(input_path: str, original_filename: str) -> str:
     """
-    Compresses PDF or Converts Image -> Compressed PDF.
+    Compresses PDF files using Pikepdf.
     Returns path to the final optimized PDF.
+    For images, Docling handles them directly - no conversion needed.
     """
-    output_path = f"{input_path}_optimized.pdf"
     ext = os.path.splitext(original_filename)[1].lower()
 
     try:
-        if ext in ['.jpg', '.jpeg', '.png', '.webp']:
-            # 1. Image -> PDF
-            with Image.open(input_path) as img:
-                # Convert RGBA to RGB (fix png transparency issues)
-                if img.mode == 'RGBA':
-                    img = img.convert('RGB')
-
-                # Resize if massive (limit to 2000px width, preserve aspect)
-                if img.width > 2000:
-                    ratio = 2000 / img.width
-                    new_size = (2000, int(img.height * ratio))
-                    img = img.resize(new_size, Image.Resampling.LANCZOS)
-
-                # Save optimized temporary JPG
-                temp_img = f"{input_path}.jpg"
-                img.save(temp_img, "JPEG", quality=70, optimize=True)
-
-                # Convert to PDF
-                with open(output_path, "wb") as f:
-                    f.write(img2pdf.convert(temp_img))
-
-                os.remove(temp_img)
-
-        elif ext == '.pdf':
-            # 2. PDF -> Compressed PDF (using Pikepdf)
+        if ext == '.pdf':
+            # Compress PDF using Pikepdf
+            output_path = f"{input_path}_optimized.pdf"
             with pikepdf.open(input_path) as pdf:
                 # Remove unreferenced resources and linearize (fast web view)
                 pdf.save(output_path, linearize=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-
+            return output_path
         else:
-            # Fallback: Just rename/copy if unknown type
+            # For images and other formats, Docling handles them directly
             return input_path
 
-        return output_path
-
     except Exception as e:
-        print(f"Compression failed: {e}, using original")
+        logger.warning(f"Compression failed: {e}, using original")
         return input_path
 
 # --- AI & Processing ---
@@ -91,9 +69,10 @@ def process_task(req: ProcessRequest):
     temp_input = None
     final_pdf_path = None
     
+    logger.info(f"Processing doc_id={req.doc_id}")
     try:
-        # 1. Download file securely
-        resp = requests.get(req.file_proxy, headers={'x-secret': WEB_SECRET})
+        # 1. Download file securely with timeout
+        resp = requests.get(req.file_proxy, headers={'x-secret': WEB_SECRET}, timeout=30)
         if resp.status_code != 200:
             raise Exception("Download Failed")
 
@@ -102,7 +81,7 @@ def process_task(req: ProcessRequest):
         with open(temp_input, "wb") as f:
             f.write(resp.content)
 
-        # 2. Compress / Standardize the file
+        # 2. Compress / Standardize the file (only for PDFs)
         final_pdf_path = compress_and_standardize(temp_input, temp_input)
 
         # 3. Extract data using Docling and AI
@@ -119,7 +98,7 @@ def process_task(req: ProcessRequest):
         # drive_id = upload_to_drive(final_pdf_path, f"{data.vendor_name or 'document'}.pdf")
         drive_id = f"fake_drive_id_{uuid.uuid4()}"  # Placeholder
 
-        # 6. Success Callback with PRD-compliant payload
+        # 6. Success Callback with PRD-compliant payload and timeout
         callback_resp = requests.post(
             f"{req.callback_url}?docId={req.doc_id}",
             headers={'x-secret': WEB_SECRET},
@@ -128,28 +107,32 @@ def process_task(req: ProcessRequest):
                 "data": data.model_dump(),
                 "drive_file_id": drive_id,
                 "error": None
-            }
+            },
+            timeout=30
         )
         
         if callback_resp.status_code != 200:
-            print(f"Callback failed: {callback_resp.status_code}, {callback_resp.text}")
+            logger.error(f"Callback failed: {callback_resp.status_code}, {callback_resp.text}")
+        else:
+            logger.info(f"Successfully processed doc_id={req.doc_id}, drive_id={drive_id}")
 
     except Exception as e:
-        print(f"Processing error for {req.doc_id}: {e}")
+        logger.error(f"Processing error for {req.doc_id}: {e}")
         # Failure Callback with PRD-compliant payload
         try:
             requests.post(
                 f"{req.callback_url}?docId={req.doc_id}",
                 headers={'x-secret': WEB_SECRET},
                 json={
-                    "status": "FAILED", 
+                    "status": "FAILED",
                     "error": str(e),
                     "data": None,
                     "drive_file_id": None
-                }
+                },
+                timeout=30
             )
         except Exception as callback_error:
-            print(f"Failed to send error callback: {callback_error}")
+            logger.error(f"Failed to send error callback: {callback_error}")
     finally:
         # Clean up temporary files
         if temp_input and os.path.exists(temp_input):

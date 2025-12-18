@@ -18,6 +18,7 @@
 	"queues": {
 		"consumers": [
 			{
+				"binding": "DOCUMENT_QUEUE",
 				"queue": "docuflow-jobs",
 				"max_batch_timeout": 30,
 				"max_batch_size": 1,

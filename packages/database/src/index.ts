@@ -1,7 +1,11 @@
 import { PrismaClient } from "@prisma/client/edge";
 import { withAccelerate } from "@prisma/extension-accelerate";
 
-const prisma = new PrismaClient().$extends(withAccelerate());
+// For Prisma 7+, use accelerateUrl in the constructor
+const prisma = new PrismaClient({
+  // In production, this would be set from environment variable
+  // accelerateUrl: process.env.DATABASE_URL
+}).$extends(withAccelerate());
 
 export const db = {
   // Enforces RLS via Session Variable
@@ -17,5 +21,10 @@ export const db = {
   // Bypasses RLS (Use with caution for system tasks)
   async sudo<T>(fn: (tx: any) => Promise<T>) {
       return fn(prisma);
-  }
+  },
+  // Get the PrismaClient instance for adapters (e.g., Better Auth)
+  getClient: () => prisma
 };
+
+// Also export the raw client for advanced usage
+export { prisma };

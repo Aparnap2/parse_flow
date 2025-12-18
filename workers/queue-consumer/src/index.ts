@@ -42,7 +42,8 @@ export default {
         const parsedMessage = QueueJobSchema.safeParse(message.body);
         if (!parsedMessage.success) {
           console.error(`Invalid queue message: ${parsedMessage.error.message}`);
-          await this.handleFailedMessage(message, env, `Invalid message format: ${parsedMessage.error.message}`);
+          // Permanent error: acknowledge to discard
+          message.ack();
           return;
         }
         
@@ -78,23 +79,12 @@ export default {
         // Message will be automatically acknowledged if no exception is thrown
       } catch (error) {
         console.error(`Error processing message for document ${message.body.docId}:`, error);
-        await this.handleFailedMessage(message, env, (error as Error).message);
+        // Trigger retry by throwing the error
+        throw error;
       }
     });
     
     // Wait for all messages to be processed
     await Promise.all(promises);
-  },
-
-  /**
-   * Handle a failed message with retry logic
-   */
-  async handleFailedMessage(message: Message<QueueJob>, env: Env, errorMessage: string): Promise<void> {
-    // Cloudflare Queues has built-in retry handling via wrangler.toml configuration
-    // For this implementation, we'll log the failure and let the built-in retry mechanism handle it
-    console.error(`Failed to process message for document ${message.body.docId}: ${errorMessage}`);
-    
-    // When max retries are exceeded, the message will automatically go to DLQ
-    // if properly configured in wrangler.toml
   }
 } satisfies ExportedHandler<Env> & QueueConsumer<QueueJob>;
