@@ -1,0 +1,30 @@
+name = "docuflow-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-31"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "docuflow-db"
+database_id = "REPLACE_D1_ID"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "docuflow-bucket"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "docuflow-index"
+
+[[queues.producers]]
+queue = "docuflow-ingest"
+binding = "INGEST_QUEUE"
+
+[[queues.producers]]
+queue = "docuflow-events"
+binding = "EVENTS_QUEUE"
+
+[ai]
+binding = "AI"
+
+[vars]
+BASE_URL = "https://docuflow-api.YOUR_SUBDOMAIN.workers.dev"

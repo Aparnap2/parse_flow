@@ -1,0 +1,6 @@
+DATABASE_URL="postgresql://postgres:password@localhost:5432/neondb"
+WEBHOOK_SECRET="test-webhook-secret"
+INTERNAL_SECRET="test-internal-secret"
+OLLAMA_BASE_URL="http://localhost:11434/v1"
+BETTER_AUTH_SECRET="test-auth-secret"
+BETTER_AUTH_URL="http://localhost:5173"
