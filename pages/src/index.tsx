@@ -34,7 +34,68 @@ app.get('/', (c) => c.html(html`
 `));
 
 app.get('/dashboard', async (c) => {
-  const user = { structurize_email: "user123@structurize.ai", plan: "pro" };
+  // Extract user ID from the authentication context (e.g., from a JWT token in cookies or headers)
+  // For now, we'll use a mock user ID - in a real implementation this would come from proper auth
+  const authHeader = c.req.header('Authorization');
+  const userId = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
+
+  // In a real implementation, you would validate the JWT token here
+  // const token = authHeader?.replace('Bearer ', '');
+  // const decoded = jwt.verify(token, c.env.JWT_SECRET);
+  // const userId = decoded.userId;
+
+  if (!userId) {
+    return c.redirect('/'); // Redirect to login page if not authenticated
+  }
+
+  // Query the database for the user and their jobs
+  const user = await c.env.DB.prepare(
+    'SELECT structurize_email, plan FROM users WHERE id = ?'
+  ).bind(userId).first();
+
+  if (!user) {
+    return c.text('User not found', 404);
+  }
+
+  // Get recent jobs for the user
+  const jobs = await c.env.DB.prepare(`
+    SELECT j.id, j.r2_key, j.status, j.created_at, j.updated_at, j.audit_flags
+    FROM jobs j
+    WHERE j.user_id = ?
+    ORDER BY j.created_at DESC
+    LIMIT 10
+  `).bind(userId).all();
+
+  // Format jobs for display
+  const jobRows = jobs.results.map((job: any) => {
+    const fileName = job.r2_key.split('/').pop() || job.r2_key;
+    let statusDisplay = '⏳ Processing';
+    let statusClass = 'text-yellow-600';
+
+    if (job.status === 'completed') {
+      statusDisplay = '✅ Completed';
+      statusClass = 'text-green-600';
+    } else if (job.status === 'flagged') {
+      statusDisplay = '⚠️ Flagged';
+      statusClass = 'text-orange-600';
+    } else if (job.status === 'failed') {
+      statusDisplay = '❌ Failed';
+      statusClass = 'text-red-600';
+    }
+
+    const createdAt = new Date(job.created_at).toLocaleString();
+
+    return `
+      <div class="flex justify-between p-4 bg-gray-50 rounded-xl">
+        <div>
+          <span class="font-medium">${fileName}</span>
+          <div class="text-sm text-gray-500">${createdAt}</div>
+        </div>
+        <span class="${statusClass} font-bold">${statusDisplay}</span>
+      </div>
+    `;
+  }).join('');
+
   return c.html(html`
 <!DOCTYPE html>
 <html>
@@ -58,10 +119,7 @@ app.get('/dashboard', async (c) => {
       <div id="jobs" class="bg-white rounded-2xl shadow-sm border p-6">
         <h2 class="text-xl font-bold mb-4">Recent Jobs</h2>
         <div class="space-y-3">
-          <div class="flex justify-between p-4 bg-gray-50 rounded-xl">
-            <span>aws-invoice.pdf</span>
-            <span class="text-green-600 font-bold">✅ Completed</span>
-          </div>
+          ${jobRows || '<div class="text-center text-gray-500 py-8">No jobs found</div>'}
         </div>
       </div>
     </div>

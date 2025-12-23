@@ -18,13 +18,21 @@ wrangler d1 execute structurize-db --file=db/schema.sql
 ## 2. Set Secrets
 ```bash
 # Email Worker
-wrangler secret put LEMONSQUEEZY_SECRET --name structurize-email
+wrangler secret put ENGINE_URL --name structurize-email
+wrangler secret put ENGINE_SECRET --name structurize-email
+wrangler secret put R2_PUBLIC_URL --name structurize-email
 
 # Sync Worker
 wrangler secret put ENGINE_SECRET --name structurize-sync
+wrangler secret put DEMO_SHEET_REFRESH_TOKEN --name structurize-sync
+wrangler secret put DEMO_SPREADSHEET_ID --name structurize-sync
+wrangler secret put EMAIL_SERVICE_URL --name structurize-sync
 
 # Billing Worker
 wrangler secret put LEMONSQUEEZY_SECRET --name structurize-billing
+wrangler secret put LEMON_STARTER_PRODUCT_ID --name structurize-billing
+wrangler secret put LEMON_PRO_PRODUCT_ID --name structurize-billing
+wrangler secret put LEMONSQEEZY_STORE_ID --name structurize-billing
 
 # Pages
 wrangler secret put JWT_SECRET --name structurize-dashboard
@@ -63,7 +71,12 @@ git push
 #   - ENGINE_SECRET
 #   - R2_ACCESS_KEY
 #   - R2_SECRET_KEY
+#   - R2_ENDPOINT
+#   - R2_PUBLIC_URL
 #   - LANGEXTRACT_API_KEY
+#   - LANGEXTRACT_MODEL_ID (optional, default: gemini-2.5-flash)
+#   - LANGEXTRACT_PASSES (optional, default: 2)
+#   - LANGEXTRACT_MAX_WORKERS (optional, default: 4)
 ```
 
 ## 6. Test End-to-End

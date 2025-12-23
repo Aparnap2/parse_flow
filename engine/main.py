@@ -38,24 +38,32 @@ INVOICE_PROMPT = textwrap.dedent("""\
 async def process_job(request: Request):
     if request.headers.get("x-secret") != ENGINE_SECRET:
         raise HTTPException(401, "Unauthorized")
-    
+
     data = await request.json()
-    r2_url = data.get("r2_url")
-    
-    resp = requests.get(r2_url)
-    resp.raise_for_status()
-    
+    r2_key = data.get("r2_key")
+    job_id = data.get("job_id")
+
+    # Use S3 client to fetch the document from R2
+    s3_client = get_s3_client()
+    response = s3_client.get_object(Bucket=R2_BUCKET, Key=r2_key)
+    pdf_content = response['Body'].read()
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        f.write(resp.content)
+        f.write(pdf_content)
         temp_pdf_path = f.name
 
     try:
+        # Get model configuration from environment variables
+        model_id = os.getenv("LANGEXTRACT_MODEL_ID", "gemini-2.5-flash")
+        extraction_passes = int(os.getenv("LANGEXTRACT_PASSES", "2"))
+        max_workers = int(os.getenv("LANGEXTRACT_MAX_WORKERS", "4"))
+
         lang_result = lx.extract(
             text_or_documents=temp_pdf_path,
             prompt_description=INVOICE_PROMPT,
-            model_id="gemini-2.5-flash",
-            extraction_passes=2,
-            max_workers=4
+            model_id=model_id,
+            extraction_passes=extraction_passes,
+            max_workers=max_workers
         )
         
         html_viz = lx.visualize([lang_result])
@@ -79,13 +87,20 @@ async def process_job(request: Request):
             table = doc_result.document.tables[0]
             line_items = table.to_dict('records')
         
+        header_data = {
+            "vendor": _find_extraction(lang_result, "Vendor Name"),
+            "date": _find_extraction(lang_result, "Invoice Date"),
+            "total": _find_extraction(lang_result, "Total Amount"),
+            "invoice_number": _find_extraction(lang_result, "Invoice Number")
+        }
+
         structured_data = {
-            "header": {
-                "vendor": _find_extraction(lang_result, "Vendor Name"),
-                "date": _find_extraction(lang_result, "Invoice Date"),
-                "total": _find_extraction(lang_result, "Total Amount"),
-                "invoice_number": _find_extraction(lang_result, "Invoice Number")
-            },
+            "header": header_data,
+            # Add flat keys for compatibility with sync worker and audit function
+            "vendor": header_data["vendor"]["value"] if header_data["vendor"] else None,
+            "date": header_data["date"]["value"] if header_data["date"] else None,
+            "total": header_data["total"]["value"] if header_data["total"] else None,
+            "invoice_number": header_data["invoice_number"]["value"] if header_data["invoice_number"] else None,
             "line_items": line_items,
             "visual_proof_url": proof_url,
             "markdown": doc_result.document.export_to_markdown()
