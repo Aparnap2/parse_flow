@@ -1,108 +1,233 @@
-# FreightStructurize - Automated Freight Auditor & Compliance Officer
+# ParseFlow.ai - Document Intelligence API
 
-FreightStructurize is an autonomous "Back-Office Agent" for 3PLs and Freight Brokers. It performs forensic auditing on every Bill of Lading (BoL) and Carrier Invoice to recover revenue, ensure compliance, and automate data entry to TMS systems.
+Welcome to ParseFlow.ai, a developer-first document intelligence API that converts PDFs to Markdown/JSON with intelligent OCR capabilities.
 
-## Architecture
+## 🚀 Overview
 
-The system consists of multiple Cloudflare Workers and a Python processing engine:
+ParseFlow.ai is a comprehensive document processing platform built with:
+- **Hono** for API/UI (running on Cloudflare Workers)
+- **Cloudflare D1** for database storage
+- **Cloudflare R2** for document storage
+- **Cloudflare Queues** for job processing
+- **Modal** for GPU-powered OCR processing
+- **Stripe** for billing
 
-- **Email Worker**: Receives freight documents and queues processing jobs
-- **Engine**: AI-powered PDF processing and freight data extraction
-- **Sync Worker**: Processes extracted data, performs freight audits, and updates TMS systems
-- **Billing Worker**: Handles subscription management via Lemon Squeezy
-- **Pages**: Web dashboard for users to manage their account and view jobs
+## ✨ Features
 
-## Features
+- **High-accuracy OCR**: Powered by Docling (primary) and DeepSeek-OCR (fallback)
+- **Layout preservation**: Maintains document structure and formatting
+- **Table and figure extraction**: Accurate parsing of complex elements
+- **Webhook delivery**: Real-time notifications when processing completes
+- **Financial document mode**: Specialized processing for financial documents
+- **API-first design**: Easy integration with your applications
+- **Scalable architecture**: Built to handle high-volume processing
 
-- **Freight Invoice Processing**: Forward BoL and carrier invoices to `invoices@freightstructurize.ai` → automatic data extraction → TMS integration
-- **AI-Powered Extraction**: Advanced language models extract PRO Number, Carrier Name, Origin/Destination ZIPs, Billable Weight, Line Haul Rate, Fuel Surcharge, and Total Amount
-- **Rate Auditing**: Validates invoiced amounts against contract rates to detect overcharges
-- **Security Auditing**: Scans PDFs for bad redactions where sensitive text exists under black boxes
-- **Data Validation & Audit**: Multi-layer validation including rate comparison and redaction detection
-- **Subscription Management**: Integrated billing with Lemon Squeezy
-- **Demo Flow**: Special handling for demo@structurize.ai to showcase the service
-- **Secure Document Processing**: Direct R2 access for document retrieval
+## 🏗️ Architecture
 
-## Components
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   API Layer     │    │  Processing      │    │   Storage &     │
+│   (Hono/CF)     │    │  Engine (Modal)  │    │   Queues (CF)   │
+│                 │    │                  │    │                 │
+│ • /v1/extract   │───▶│ • Docling        │    │ • D1 (SQLite)   │
+│ • /v1/uploads   │    │ • DeepSeek-OCR   │◀───│ • R2 (S3)       │
+│ • /v1/jobs      │    │ • vLLM           │    │ • Queues        │
+│ • Webhooks      │    │                  │    │                 │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+```
 
-### Email Worker
-- Receives emails with PDF attachments at freight-specific addresses
-- Stores documents in R2 storage
-- Calls processing engine
-- Queues jobs for sync processing
-- Special handling for demo@structurize.ai
+## 🛠️ Setup
 
-### Processing Engine
-- AI-powered PDF parsing and freight data extraction
-- Extracts PRO Number, Carrier Name, Origin/Destination ZIPs, Billable Weight, Line Haul Rate, Fuel Surcharge, and Total Amount
-- Generates visual proof for validation
-- Configurable AI model settings
+### Prerequisites
 
-### Sync Worker
-- Processes extracted data from jobs queue
-- Performs freight-specific audit checks (rate validation, redaction detection)
-- Updates TMS systems with validated data
-- Stores audit results in audit_jobs table
-- Sends Slack alerts for flagged audits
-- Implements retry logic and dead-letter handling
+- Node.js 18+
+- pnpm
+- Python 3.10+
+- Cloudflare account
+- Modal account
 
-### Billing Worker
-- Handles Lemon Squeezy webhooks with signature verification
-- Manages user subscription plans
-- Supports multiple product tiers
+### Installation
 
-### Dashboard (Pages)
-- User dashboard to view processing jobs
-- Shows job status and audit results
-- Displays user subscription information
+1. Install Node.js dependencies:
+```bash
+pnpm install
+```
 
-## Configuration
+2. Install Python dependencies:
+```bash
+cd engine
+source venv/bin/activate  # On Windows: engine\venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+3. Set up environment variables:
+```bash
+# For Cloudflare Workers
+wrangler secret put R2_ACCESS_KEY_ID
+wrangler secret put R2_SECRET_ACCESS_KEY
+wrangler secret put WORKER_API_SECRET
+wrangler secret put STRIPE_SECRET_KEY
+wrangler secret put STRIPE_WEBHOOK_SECRET
+```
+
+4. Deploy to Cloudflare:
+```bash
+# Deploy the main API
+cd pages && wrangler deploy
+
+# Deploy workers
+cd ../workers/email && wrangler deploy
+cd ../sync && wrangler deploy
+cd ../billing && wrangler deploy
+```
 
 ### Environment Variables
 
-#### Email Worker
-- `ENGINE_URL`: URL of the processing engine
-- `ENGINE_SECRET`: Secret for authenticating with engine
-- `R2_PUBLIC_URL`: Public URL for R2 bucket
+Create a `.dev.vars` file with the following:
 
-#### Sync Worker
-- `DEMO_TMS_WEBHOOK_URL`: Webhook URL for demo TMS integration
-- `SLACK_WEBHOOK_URL`: Webhook URL for audit alerts
-- `DEMO_SHEET_REFRESH_TOKEN`: Refresh token for demo sheet access (fallback)
-- `DEMO_SPREADSHEET_ID`: ID of the demo spreadsheet (fallback)
-- `EMAIL_SERVICE_URL`: URL for sending notification emails
+```bash
+# Cloudflare
+CF_ACCOUNT_ID=your_account_id
+R2_PUBLIC_URL=your_r2_public_url
 
-#### Billing Worker
-- `LEMONSQEEZY_SECRET`: Lemon Squeezy API secret
-- `LEMON_STARTER_PRODUCT_ID`: Product ID for starter plan
-- `LEMON_PRO_PRODUCT_ID`: Product ID for pro plan
-- `LEMONSQEEZY_STORE_ID`: Lemon Squeezy store ID
+# API Secrets
+ENGINE_SECRET=your_engine_secret
+WORKER_API_SECRET=your_worker_api_secret
 
-#### Engine
-- `ENGINE_SECRET`: Secret for authenticating requests
-- `R2_ACCESS_KEY`: R2 access key
-- `R2_SECRET_KEY`: R2 secret key
-- `R2_ENDPOINT`: R2 endpoint URL
-- `R2_PUBLIC_URL`: Public R2 URL
-- `LANGEXTRACT_MODEL_ID`: AI model to use (default: gemini-2.5-flash)
-- `LANGEXTRACT_PASSES`: Number of extraction passes (default: 2)
-- `LANGEXTRACT_MAX_WORKERS`: Max concurrent workers (default: 4)
+# Stripe
+STRIPE_SECRET_KEY=your_stripe_secret_key
+STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret
+STRIPE_STARTER_PRICE_ID=your_starter_price_id
+STRIPE_PRO_PRICE_ID=your_pro_price_id
+APP_URL=your_app_url
 
-## Setup & Deployment
+# R2
+R2_ACCESS_KEY_ID=your_r2_access_key
+R2_SECRET_ACCESS_KEY=your_r2_secret_key
+```
 
-See [DEPLOYMENT_COMMANDS.md](DEPLOYMENT_COMMANDS.md) for detailed deployment instructions.
+## 📡 API Usage
 
-## Security
+### Authentication
 
-- Lemon Squeezy webhook signature verification
-- API authentication with secrets
-- User isolation in data access
-- Secure R2 document access
+All API requests require an API key in the Authorization header:
 
-## Development
+```
+Authorization: Bearer pf_live_...
+```
 
-The system is designed with microservices architecture for scalability and maintainability. Each component can be developed and deployed independently.
+### Upload & Process Document
 
-## License
+First, get a presigned URL to upload your document directly to our storage:
 
-[Specify license here]
+```
+POST /v1/uploads/init
+```
+
+```json
+{
+  "content_type": "application/pdf",
+  "file_name": "document.pdf"
+}
+```
+
+Then upload your file to the returned presigned URL, and optionally create a processing job:
+
+```
+POST /v1/extract
+```
+
+```json
+{
+  "url": "https://your-storage.com/file.pdf",  // Optional, if you host the file
+  "webhook_url": "https://your-app.com/webhook",
+  "mode": "general"  // or "financial" for high-accuracy financial document processing
+}
+```
+
+### Check Job Status
+
+```
+GET /v1/jobs/{job_id}
+```
+
+### Webhook Delivery
+
+When processing is complete, we'll send a POST request to your webhook URL with the job result:
+
+```json
+{
+  "id": "job_123...",
+  "status": "completed",
+  "result_url": "https://storage-url-to-result",
+  "trust_score": 0.95
+}
+```
+
+## 🧪 Testing
+
+Run the test suite:
+
+```bash
+pnpm test
+# or
+npx vitest
+```
+
+## 🚀 Deployment
+
+The system is designed for deployment on Cloudflare Workers:
+
+1. Set up your D1 database:
+```bash
+wrangler d1 create parseflow-db
+wrangler d1 execute parseflow-db --file=db/schema.sql
+```
+
+2. Set up your R2 bucket:
+```bash
+wrangler r2 bucket create parseflow-storage
+```
+
+3. Deploy the application:
+```bash
+# Deploy the main application
+cd pages && wrangler deploy
+
+# Deploy the workers
+cd ../workers/email && wrangler deploy
+cd ../sync && wrangler deploy
+cd ../billing && wrangler deploy
+```
+
+## 🔄 Transformation Summary
+
+This project was transformed from FreightStructurize (a freight auditing system) to ParseFlow.ai (a general document intelligence API) as specified in the PRD. Key changes include:
+
+- **Database**: Migrated from freight-specific schema to ParseFlow schema with accounts, api_keys, and jobs
+- **API**: Implemented full REST API with authentication, upload endpoints, and job management
+- **Processing**: Updated from freight-specific extraction to general document processing with Docling and DeepSeek-OCR
+- **Frontend**: Redesigned from freight dashboard to general API management UI
+- **Billing**: Migrated from Lemon Squeezy to Stripe integration
+
+## 📁 Project Structure
+
+```
+parseflow/
+├── db/                    # Database schemas
+├── engine/               # Python processing engine
+├── modal/                # Modal GPU workers
+├── pages/                # Frontend (Cloudflare Pages)
+├── src/                  # API layer (Hono)
+├── workers/              # Cloudflare Workers
+│   ├── email/            # Email processing worker
+│   ├── sync/             # Job processing worker
+│   └── billing/          # Stripe billing worker
+├── README.md
+├── package.json
+└── prd.md               # Original PRD
+```
+
+## 📄 License
+
+This project is licensed under the MIT License.

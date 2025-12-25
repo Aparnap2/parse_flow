@@ -1,312 +1,306 @@
-# PRD: FREIGHTSTRUCTURIZE (Vertical AI Agent)
+This is the **Final, Canonical Product Requirements Document (PRD)** for **ParseFlow.ai**.
 
-**Status:** PRODUCTION LOCKED
- **Role:** Automated Freight Auditor & Compliance Officer
- **Version:** 1.0.0
+It consolidates every architectural decision, "missing manual" fix, and operational constraint we have defined. It is ready for immediate implementation.
 
 ------
 
-## 1. System Identity & Mission
+# 🚀 ParseFlow.ai — Master Build Specification
 
-**FreightStructurize** is an autonomous "Back-Office Agent" for 3PLs and Freight Brokers. It does not just OCR documents; it performs **forensic auditing** on every Bill of Lading (BoL) and Carrier Invoice.
-
-**Mission:**
-
-1. **Recover Revenue:** Catch carrier overcharges (Rate vs. Contract).
-2. **Ensure Compliance:** Detect "bad redactions" (text leaks) in sensitive legal/freight docs.
-3. **Automate Entry:** Sync validated data to TMS (Transportation Management System).
-
-**The Promise:** "Forward the invoice. We find the lost money."
+| Metadata       | Details                                                      |
+| :------------- | :----------------------------------------------------------- |
+| **Version**    | 1.0 (Final Build-Ready)                                      |
+| **Mission**    | Developer-first document intelligence API (PDF → Markdown/JSON). |
+| **Core Stack** | Hono (API/UI), Cloudflare Workers, D1, R2, Queues, Modal (GPU). |
+| **Key AI**     | Docling (Primary) + **DeepSeek-OCR** (High-Accuracy Fallback). |
 
 ------
 
-## 2. Vertical Workflow (The Invisible Loop)
+## 1. System Architecture & Design
 
-## **Phase 1: Ingestion**
+## High-Level Data Flow
 
-- **Trigger:** Email received at `invoices@freightstructurize.ai` (or client domain).
-- **Filter:** Reject spam. Isolate PDF attachments.
-- **Queue:** Push to Redis Job Queue (`job_id: uuid`).
+1. **Ingestion:** Client requests presigned URL → Uploads directly to R2.
+2. **Dispatch:** Client calls API → Worker creates Job (D1) → Enqueues message.
+3. **Compute:** Modal (GPU) pulls message via HTTP → Runs DeepSeek-OCR/Docling.
+4. **Delivery:** Modal uploads JSON to R2 → Calls Worker Callback → Worker fires Webhook.
+5. **Lifecycle:** R2 policies auto-delete inputs (24h) and results (72h).
 
-## **Phase 2: The "Brain" (Extraction)**
+## The Stack (Hono-First)
 
-- **OCR:** Convert PDF to Markdown (preserving table structures).
-- **LLM Extraction:** Llama-3-70b extracts structured JSON:
-  - `PRO_Number` (Tracking ID)
-  - `Carrier_Name`
-  - `Origin_Zip`, `Dest_Zip`
-  - `Billable_Weight`
-  - `Line_Haul_Rate`, `Fuel_Surcharge`, `Total_Amount`
-
-## **Phase 3: The "Judge" (Validation Core)**
-
-- **Rate Audit:**
-  - Fetch `RateCard` for Carrier + Lane (Zip to Zip).
-  - Calculate `Expected_Cost = (Weight * Contract_Rate) + Fuel`.
-  - Compare `Invoice_Total` vs. `Expected_Cost`.
-  - **Rule:** If `Invoice > Expected + 3%`, Flag as **OVERCHARGE**.
-- **Redaction Audit (The "X-Ray"):**
-  - Scan PDF for black vector rectangles.
-  - Check for selectable text layers *underneath* or *near* rectangles.
-  - **Rule:** If text exists under rectangle, Flag as **SECURITY_LEAK**.
-
-## **Phase 4: Execution**
-
-- **Success:** If Flags = 0, push JSON to TMS API (FreightBooks/Magaya).
-- **Failure:** If Flags > 0, alert Slack channel `#audit-alerts` with "Overcharge Detected: $142.50" or "Compliance Risk: Failed Redaction".
+- **API & Frontend:** Hono (running on Cloudflare Workers). Frontend is Server-Side Rendered (SSR) JSX.
+- **Database:** Cloudflare D1 (SQLite).
+- **Storage:** Cloudflare R2 (S3-compatible).
+- **Queue:** Cloudflare Queues (Standard, pull-based).
+- **GPU:** Modal (Python 3.10 + vLLM).
 
 ------
 
-## 3. Data Model (PostgreSQL / D1)
+## 2. Data Modelling (D1 Schema)
+
+Run `npx wrangler d1 migrations create parseflow-db init` and use this SQL:
 
 ```
-sql-- 1. Tenants (3PL Firms)
-CREATE TABLE organizations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL,
-    api_key TEXT UNIQUE NOT NULL,
-    tms_webhook_url TEXT
+sql-- Accounts & Billing
+CREATE TABLE accounts (
+  id TEXT PRIMARY KEY,          -- 'acc_...'
+  email TEXT UNIQUE,
+  stripe_customer_id TEXT,
+  credits_balance INTEGER DEFAULT 10,
+  created_at INTEGER
 );
 
--- 2. The Rules (Contract Rates)
-CREATE TABLE rate_cards (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    org_id UUID REFERENCES organizations(id),
-    carrier_name TEXT NOT NULL,
-    origin_zone TEXT,
-    dest_zone TEXT,
-    min_weight INTEGER,
-    max_weight INTEGER,
-    rate_per_lb DECIMAL(10, 4),
-    base_charge DECIMAL(10, 2),
-    effective_date DATE,
-    expiry_date DATE
+-- Authentication
+CREATE TABLE api_keys (
+  key TEXT PRIMARY KEY,         -- 'pf_live_...'
+  account_id TEXT NOT NULL,
+  label TEXT,
+  revoked BOOLEAN DEFAULT 0,
+  created_at INTEGER,
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
 
--- 3. The Jobs (Audits)
-CREATE TABLE audit_jobs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    org_id UUID REFERENCES organizations(id),
-    created_at TIMESTAMP DEFAULT NOW(),
-    source_email TEXT,
-    original_filename TEXT,
-    
-    -- Extracted Data
-    pro_number TEXT,
-    carrier_extracted TEXT,
-    weight_extracted DECIMAL(10, 2),
-    amount_invoiced DECIMAL(10, 2),
-    
-    -- Audit Results
-    amount_calculated DECIMAL(10, 2),
-    variance_amount DECIMAL(10, 2),
-    is_overcharge BOOLEAN DEFAULT FALSE,
-    has_bad_redaction BOOLEAN DEFAULT FALSE,
-    
-    -- Status
-    status TEXT CHECK (status IN ('PROCESSING', 'APPROVED', 'FLAGGED', 'SYNCED'))
+-- Core Job Log
+CREATE TABLE jobs (
+  id TEXT PRIMARY KEY,          -- 'job_...'
+  account_id TEXT NOT NULL,
+  status TEXT,                  -- 'queued', 'processing', 'completed', 'failed'
+  mode TEXT,                    -- 'general' (Docling) or 'financial' (DeepSeek)
+  input_key TEXT,               -- R2 key: 'uploads/...'
+  output_key TEXT,              -- R2 key: 'results/...'
+  webhook_url TEXT,
+  trust_score REAL,             -- 0.0 to 1.0
+  error_message TEXT,
+  created_at INTEGER,
+  completed_at INTEGER
 );
 
--- 4. Audit Trail (Logs)
-CREATE TABLE audit_logs (
-    id UUID PRIMARY KEY,
-    job_id UUID REFERENCES audit_jobs(id),
-    log_level TEXT,
-    message TEXT, -- e.g. "Rate card matching logic applied: Lane NYC->CHI"
-    timestamp TIMESTAMP DEFAULT NOW()
-);
+-- Performance Indexing
+CREATE INDEX idx_jobs_acc_date ON jobs(account_id, created_at DESC);
+CREATE INDEX idx_keys_lookup ON api_keys(key) WHERE revoked = 0;
 ```
 
 ------
 
-## 4. The Core Engine (Python Code)
+## 3. Feature-by-Feature Implementation Map
 
-This is the production logic for Phase 3 (Validation). It assumes extraction has passed JSON data to this class.
+## Feature A: Ingestion (Presigned "Direct-to-Cloud")
 
-**Dependencies:** `fitz` (PyMuPDF), `pandas`, `pydantic`.
+- **User Story:** "I want to upload a 50MB PDF without hitting API timeouts."
+- **SOP:** Client gets a temporary upload URL, PUTs the file, then starts the job.
+- **Technical Implementation:**
+  - Use **AWS SDK v3** (not standard CF bindings) to generate presigned URLs.
+  - Client-side or SDK-side hashing (SHA256) recommended.
+
+## Feature B: The Processing Pipeline (Queue + GPU)
+
+- **User Story:** "I want high accuracy for tables, even if it takes 30 seconds."
+- **SOP:** Worker pushes job to Queue. Modal polls Queue, runs AI, returns result.
+- **Technical Implementation:**
+  - **Cloudflare Queue:** Stores `{ job_id, input_key, mode }`.
+  - **Modal:** Runs `vLLM` with `deepseek-ai/DeepSeek-OCR`.
+  - **Fallback Logic:** Default to Docling. If `mode='financial'` or `trust_score < 0.85`, run DeepSeek-OCR on specific pages.
+
+## Feature C: Webhooks & Delivery
+
+- **User Story:** "Notify my backend when the parse is done."
+- **SOP:** Modal hits internal callback → Worker updates DB → Worker POSTs to user webhook.
+- **Technical Implementation:**
+  - **Security:** Internal callback protected by `x-internal-secret`.
+  - **Payload:** Webhook sends `{ job_id, status, result_url }`. The actual JSON is in R2.
+
+## Feature D: Billing (Stripe)
+
+- **User Story:** "I buy credits and they appear instantly."
+- **Technical Implementation:**
+  - Stripe Webhook listens for `checkout.session.completed`.
+  - **Critical Fix:** Must use `Stripe.createSubtleCryptoProvider()` in Workers.
+
+------
+
+## 4. File Structure
 
 ```
-pythonimport fitz  # PyMuPDF
-import pandas as pd
-from typing import List, Dict, Optional
-from pydantic import BaseModel
-from datetime import datetime
+text/
+├── wrangler.toml              # CF Config (Secrets, D1, Queues, R2)
+├── package.json
+├── migrations/                # D1 SQL files
+├── src/
+│   ├── index.tsx              # Hono Entry (CORS, Routing)
+│   ├── api/
+│   │   ├── extract.ts         # POST /v1/extract, /v1/uploads/init
+│   │   ├── jobs.ts            # GET /v1/jobs/:id
+│   │   └── webhooks.ts        # POST /stripe, POST /internal/callback
+│   ├── lib/
+│   │   ├── r2.ts              # AWS SDK Client generator
+│   │   └── auth.ts            # API Key validation
+│   └── views/                 # Hono JSX (Dashboard, Login)
+└── modal/
+    └── gpu_worker.py          # Python: DeepSeek-OCR + Docling
+```
 
-# --- Data Structures ---
+------
 
-class InvoiceData(BaseModel):
-    pro_number: str
-    carrier: str
-    origin_zip: str
-    dest_zip: str
-    weight_lbs: float
-    total_amount: float
-    line_items: List[Dict]
+## 5. Copy-Paste Code Reference
 
-class AuditResult(BaseModel):
-    job_id: str
-    is_compliant: bool
-    flags: List[str]
-    calculated_rate: float
-    savings_identified: float
-    security_risk: bool
+## `src/lib/r2.ts` (The Presigned URL Fix)
 
-# --- The Engine ---
+*Standard R2 bindings cannot sign URLs. This wrapper is required.*
 
-class FreightAuditor:
-    def __init__(self, rate_card_df: pd.DataFrame):
-        """
-        rate_card_df columns: ['carrier', 'origin_zone', 'dest_zone', 'min_w', 'max_w', 'rate']
-        """
-        self.rates = rate_card_df
+```
+typescriptimport { S3Client, PutObjectCommand } from '@aws-sdk/client-s3'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 
-    def detect_bad_redactions(self, pdf_path: str) -> bool:
-        """
-        Scans PDF for 'Lazy Redaction' where text exists under black boxes.
-        Returns True if a security risk is found.
-        """
-        doc = fitz.open(pdf_path)
-        risk_detected = False
-        
-        for page in doc:
-            # 1. Find vector drawings (rectangles) that are black/dark
-            drawings = [
-                d for d in page.get_drawings() 
-                if d['fill'] and sum(d['fill']) < 0.5  # Assuming dark fill
-            ]
-            
-            # 2. Extract text words with their bounding boxes
-            words = page.get_text("words")  # (x0, y0, x1, y1, "text", ...)
+export const createS3Client = (env: any) => new S3Client({
+  region: 'auto',
+  endpoint: `https://${env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: env.R2_ACCESS_KEY_ID,     // Set via wrangler secret
+    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+  },
+})
 
-            for rect in drawings:
-                rx0, ry0, rx1, ry1 = rect['rect']
-                
-                # Check if any word is technically 'inside' or overlapping the black box
-                for w in words:
-                    wx0, wy0, wx1, wy1, text = w[:5]
-                    
-                    # Intersection logic
-                    overlap = not (wx1 < rx0 or wx0 > rx1 or wy1 < ry0 or wy0 > ry1)
-                    
-                    if overlap:
-                        # If text is selectable/extractable but covered by draw, it's a LEAK.
-                        print(f"SECURITY ALERT: Text '{text}' found under redaction on page {page.number}")
-                        risk_detected = True
-                        break
-            
-            if risk_detected:
-                break
-                
-        doc.close()
-        return risk_detected
+export const generatePresignedPut = async (env: any, key: string, contentType: string) => {
+  const client = createS3Client(env)
+  const cmd = new PutObjectCommand({ 
+    Bucket: 'parseflow-storage', // Your bucket name
+    Key: key, 
+    ContentType: contentType 
+  })
+  return getSignedUrl(client, cmd, { expiresIn: 900 }) // 15 mins
+}
+```
 
-    def calculate_expected_cost(self, data: InvoiceData) -> float:
-        """
-        Matches Carrier + Lane + Weight against loaded Rate Cards.
-        """
-        # 1. Filter by Carrier
-        carrier_rates = self.rates[self.rates['carrier'] == data.carrier]
-        
-        # 2. Filter by Zone (Simplified Zip matching)
-        # In prod, use a dedicated Zone Lookup Table
-        lane_rates = carrier_rates[
-            (carrier_rates['origin_zone'] == data.origin_zip[:3]) & 
-            (carrier_rates['dest_zone'] == data.dest_zip[:3])
-        ]
-        
-        # 3. Filter by Weight Break
-        valid_rate = lane_rates[
-            (lane_rates['min_w'] <= data.weight_lbs) & 
-            (lane_rates['max_w'] >= data.weight_lbs)
-        ]
-        
-        if valid_rate.empty:
-            raise ValueError(f"No contract rate found for {data.carrier} on lane {data.origin_zip}->{data.dest_zip}")
-            
-        rate_row = valid_rate.iloc[0]
-        base_cost = data.weight_lbs * rate_row['rate']
-        
-        # Hardcoded 15% Fuel Surcharge for MVP (External API in V2)
-        total_expected = base_cost * 1.15 
-        return round(total_expected, 2)
+## `src/api/webhooks.ts` (Stripe + Internal Callback)
 
-    def audit_shipment(self, pdf_path: str, data: InvoiceData, job_id: str) -> AuditResult:
-        flags = []
-        is_compliant = True
-        security_risk = False
-        savings = 0.0
-        
-        # Step 1: Security Audit
-        if self.detect_bad_redactions(pdf_path):
-            flags.append("CRITICAL: Bad Redaction Detected (Text Leak)")
-            security_risk = True
-            is_compliant = False
-            
-        # Step 2: Financial Audit
-        try:
-            expected = self.calculate_expected_cost(data)
-            variance = data.total_amount - expected
-            
-            # Tolerance: If variance > $5.00 or > 2%
-            if variance > 5.00 and (variance / expected) > 0.02:
-                flags.append(f"OVERCHARGE: Invoiced ${data.total_amount}, Contract ${expected}")
-                savings = variance
-                is_compliant = False
-            
-        except ValueError as e:
-            flags.append(f"RATE_MISSING: {str(e)}")
-            expected = 0.0
-            is_compliant = False
+```
+typescriptimport { Hono } from 'hono'
+import Stripe from 'stripe'
 
-        return AuditResult(
-            job_id=job_id,
-            is_compliant=is_compliant,
-            flags=flags,
-            calculated_rate=expected,
-            savings_identified=savings,
-            security_risk=security_risk
+const app = new Hono<{ Bindings: Bindings }>()
+
+// 1. Internal Callback (From Modal)
+app.post('/internal/complete', async (c) => {
+  const secret = c.req.header('x-internal-secret')
+  if (secret !== c.env.WORKER_API_SECRET) return c.text('Unauthorized', 401)
+
+  const { job_id, status, metrics } = await c.req.json()
+  
+  // Update D1
+  await c.env.DB.prepare(
+    'UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?'
+  ).bind(status, Date.now(), job_id).run()
+
+  // Trigger User Webhook (Fire & Forget)
+  const job = await c.env.DB.prepare('SELECT webhook_url FROM jobs WHERE id = ?').bind(job_id).first()
+  if (job?.webhook_url) {
+    c.executionCtx.waitUntil(fetch(job.webhook_url, { 
+      method: 'POST', 
+      body: JSON.stringify({ id: job_id, status }) 
+    }))
+  }
+  return c.json({ ok: true })
+})
+
+// 2. Stripe Webhook (WebCrypto Fix)
+app.post('/stripe', async (c) => {
+  const sig = c.req.header('stripe-signature')
+  const body = await c.req.text()
+  
+  const stripe = new Stripe(c.env.STRIPE_SECRET_KEY, {
+    apiVersion: '2023-10-16',
+    httpClient: Stripe.createFetchHttpClient(),
+  })
+  
+  try {
+    const event = await stripe.webhooks.constructEventAsync(
+      body, sig!, c.env.STRIPE_WEBHOOK_SECRET, undefined, Stripe.createSubtleCryptoProvider()
+    )
+    if (event.type === 'checkout.session.completed') {
+        // Add credits logic here
+    }
+  } catch (err) {
+    return c.text(`Webhook Error`, 400)
+  }
+  return c.json({ received: true })
+})
+
+export default app
+```
+
+## `modal/gpu_worker.py` (DeepSeek-OCR Logic)
+
+*Uses vLLM for max throughput. Note the specialized prompt.*
+
+```
+pythonimport modal
+import os
+
+# Image Definition: vLLM is critical for DeepSeek-OCR
+image = (
+    modal.Image.debian_slim()
+    .pip_install("vllm>=0.6.3", "transformers", "numpy", "Pillow", "requests")
+)
+
+app = modal.App("parseflow-worker", image=image)
+
+@app.cls(gpu="A10G", container_idle_timeout=300)
+class DeepSeekProcessor:
+    @modal.enter()
+    def load_model(self):
+        from vllm import LLM
+        # Use the OCR-SPECIALIZED model (not Janus-Pro)
+        self.llm = LLM(
+            model="deepseek-ai/DeepSeek-OCR",
+            trust_remote_code=True,
+            enforce_eager=True
         )
 
-# --- Execution Example (Mock) ---
+    @modal.method()
+    def process(self, r2_url, mode="general"):
+        from vllm import SamplingParams
+        
+        # PROMPT: "grounding" enables bounding box / layout awareness
+        prompt_text = "<image>\n<|grounding|>Convert the document to markdown." if mode == "financial" else "<image>\nConvert the document to markdown."
+        
+        sampling_params = SamplingParams(max_tokens=4096, temperature=0.1)
+        
+        # In production, you download r2_url to local bytes first
+        # This is simplified vLLM usage:
+        outputs = self.llm.generate(
+            {"prompt": prompt_text, "multi_modal_data": {"image": r2_url}},
+            sampling_params
+        )
+        return outputs[0].outputs[0].text
 
-if __name__ == "__main__":
-    # 1. Load Rate Cards (In-Memory for MVP)
-    rates_data = {
-        'carrier': ['FedEx_Freight', 'XPO_Logistics'],
-        'origin_zone': ['100', '902'], # NYC, LA
-        'dest_zone': ['606', '331'],   # CHI, MIA
-        'min_w': [0, 0],
-        'max_w': [10000, 10000],
-        'rate': [0.45, 0.55] # Cents per lb
-    }
-    df = pd.DataFrame(rates_data)
-    auditor = FreightAuditor(df)
-
-    # 2. Mock Extracted Data (From Llama 3)
-    invoice = InvoiceData(
-        pro_number="PRO-998877",
-        carrier="FedEx_Freight",
-        origin_zip="10001",
-        dest_zip="60601",
-        weight_lbs=2500,
-        total_amount=1450.00, # Expected: ~1293.75 (2500 * .45 * 1.15) -> Overcharge
-        line_items=[]
-    )
-
-    # 3. Run Audit
-    # Assuming 'test_invoice.pdf' exists locally
-    # result = auditor.audit_shipment("test_invoice.pdf", invoice, "job_123")
-    
-    # print(result.json(indent=2))
+# Queue Consumer (HTTP Pull Emulation or Direct Call)
+@app.function(schedule=modal.Period(seconds=5), secrets=[modal.Secret.from_name("parseflow-secrets")])
+def poll_queue():
+    import requests
+    # 1. Pull from Cloudflare Queue via API
+    # 2. Map to self.process.remote()
+    # 3. Post back to WORKER_CALLBACK_URL with header x-internal-secret
+    pass
 ```
 
 ------
 
-## 5. Implementation Notes (Zero-Ambiguity)
+## 6. Operational & Security Checklist (Do Not Skip)
 
-1. **PDF Redaction Logic:** The code uses `PyMuPDF` (fitz). It detects drawings (black rectangles) and checks intersection with text layers. This is the exact mechanism "X-Ray" tools use to find leaks.
-2. **Rate Logic:** The `pandas` DataFrame acts as the in-memory cache of the SQL `rate_cards` table. In production, load this from Redis for speed.
-3. **Fuel Surcharge:** The code uses a flat 1.15 multiplier. In production, fetch weekly DOE (Dept of Energy) fuel averages to adjust this dynamically.
-4. **Integration:** The `FreightAuditor` class is designed to be called by a Celery/Redis worker processing the job queue.
-5. **Output:** The `AuditResult` object is what gets saved to the `audit_jobs` table in PostgreSQL. Flags are serialized to JSON.
+1. **Secrets Management:**
+   - Run `wrangler secret put R2_ACCESS_KEY_ID` (and Secret Key).
+   - Run `wrangler secret put WORKER_API_SECRET` (Shared with Modal).
+   - Run `wrangler secret put STRIPE_SECRET_KEY`.
+2. **CORS:** Ensure `app.use('*', cors())` is in `src/index.tsx`.
+3. **Retention:** Go to Cloudflare R2 Dashboard → Settings → Add Lifecycle Rule:
+   - Prefix `uploads/`: expire 1 day.
+   - Prefix `results/`: expire 3 days.
+4. **Local Dev:**
+   - Use `wrangler dev --remote` to test Queues/D1 interaction realistically.
+   - For UI, just use standard Hono JSX; no `npm run build` needed for frontend.
+5. **Environment Variables:**
+   - `CF_ACCOUNT_ID` must be in `wrangler.toml` (vars) for the AWS Client to work.
+
+
+
+
 

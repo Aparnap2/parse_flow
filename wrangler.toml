@@ -1,0 +1,26 @@
+name = "parseflow-api"
+main = "src/index.tsx"
+compatibility_date = "2025-12-22"
+
+[env.production]
+account_id = "YOUR_CF_ACCOUNT_ID"  # Replace with your actual Cloudflare account ID
+workers_dev = false
+route = ""
+
+# Bindings for D1, R2, Queues
+[[d1_databases]]
+binding = "DB"
+database_name = "parseflow-db"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "parseflow-storage"
+
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "parseflow-jobs"
+
+# Environment variables
+[vars]
+CF_ACCOUNT_ID = "YOUR_CF_ACCOUNT_ID"  # This is needed for R2 client

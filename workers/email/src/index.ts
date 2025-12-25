@@ -6,11 +6,11 @@ export default {
       const raw = await new Response(message.raw as ReadableStream).arrayBuffer();
       const parser = new PostalMime();
       const email = await parser.parse(raw as ArrayBuffer);
-      
-      const attachment = email.attachments?.find((a: any) => 
+
+      const attachment = email.attachments?.find((a: any) =>
         a.contentType?.startsWith('application/pdf')
       );
-      
+
       if (!attachment) {
         console.log('No PDF attachment, skipping');
         return;
@@ -18,124 +18,51 @@ export default {
 
       const recipient = message.to[0].address;
 
-      // Check if this is a freight-specific email address
-      const isFreight = recipient.endsWith('@freightstructurize.ai') || recipient === 'invoices@freightstructurize.ai';
-      // Check if this is the demo email address
-      const isDemo = recipient === 'demo@structurize.ai';
+      // For ParseFlow, we need to identify the account based on the email or other means
+      // For now, we'll use a simplified approach - in a real system this would be more sophisticated
+      let accountId;
 
-      let user, userId, orgId;
+      // Check if this is a demo email address
+      const isDemo = recipient === 'demo@parseflow.ai';
 
-      if (isFreight) {
-        // For freight emails, look up organization
-        // In a real implementation, you might have a separate organizations table
-        // For now, we'll create or find an organization record
-        const orgResult = await env.DB.prepare(
-          'SELECT id FROM organizations WHERE api_key = ?' // This assumes we might use API key or email to identify org
-        ).bind(recipient).first(); // Using email as identifier for now
-
-        if (orgResult) {
-          orgId = orgResult.id;
-        } else {
-          // Create an organization if it doesn't exist
-          orgId = crypto.randomUUID();
-          await env.DB.prepare(`
-            INSERT INTO organizations (id, name, api_key, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(
-            orgId,
-            `Organization for ${recipient}`, // Organization name
-            recipient, // Using email as API key for now
-            Date.now(),
-            Date.now()
-          ).run();
-        }
-        userId = orgId; // For freight, we'll use orgId as userId for database consistency
-      } else if (isDemo) {
-        // For demo flow, create or get a dedicated demo user
-        const demoUser = await env.DB.prepare(
-          'SELECT id FROM users WHERE structurize_email = ?'
-        ).bind('demo@structurize.ai').first();
-
-        if (demoUser) {
-          userId = demoUser.id;
-        } else {
-          // Create a demo user if it doesn't exist
-          userId = crypto.randomUUID();
-          await env.DB.prepare(`
-            INSERT INTO users (id, email, structurize_email, google_refresh_token, plan, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-          `).bind(
-            userId,
-            'demo@structurize.ai',
-            'demo@structurize.ai',
-            '', // Empty refresh token for demo
-            'starter', // Default plan
-            Date.now()
-          ).run();
-        }
-        orgId = userId; // For demo, use userId as orgId
+      if (isDemo) {
+        // For demo, we might use a special demo account
+        // In a real implementation, you'd have proper account identification
+        accountId = 'demo_account_id'; // This is a placeholder
       } else {
-        // Regular user lookup
-        const userResult = await env.DB.prepare(
-          'SELECT id FROM users WHERE structurize_email = ?'
-        ).bind(recipient).first();
-
-        if (!userResult) {
-          console.log('Unknown user:', recipient);
-          return;
-        }
-        userId = userResult.id;
-        orgId = userId; // For regular users, orgId is the same as userId for now
+        // In a real system, you would identify the account based on:
+        // 1. The email domain (if using account-specific domains)
+        // 2. A lookup table mapping emails to accounts
+        // 3. API key passed in email headers
+        // For now, we'll use a placeholder approach
+        accountId = `account_for_${recipient.replace(/[^a-zA-Z0-9]/g, '_')}`;
       }
 
-      const r2Key = `inbox/${userId}/${Date.now()}.pdf`;
-      await env.INBOX_BUCKET.put(r2Key, attachment.content, {
+      // Store document in R2 with account-specific path
+      const r2Key = `uploads/${accountId}/${Date.now()}.pdf`;
+      await env.R2.put(r2Key, attachment.content, {
         httpMetadata: { contentType: attachment.contentType }
       });
 
       const jobId = crypto.randomUUID();
 
-      // Insert initial job record
+      // Insert initial job record using the ParseFlow schema
       await env.DB.prepare(`
-        INSERT INTO jobs (id, user_id, r2_key, status, source_email, created_at, updated_at)
-        VALUES (?, ?, ?, 'processing', ?, ?, ?)
-      `).bind(jobId, userId, r2Key, message.from, Date.now(), Date.now()).run();
+        INSERT INTO jobs (id, account_id, input_key, status, created_at)
+        VALUES (?, ?, ?, 'queued', ?)
+      `).bind(jobId, accountId, r2Key, Date.now()).run();
 
-      // Call the engine to process the document
-      const engineResponse = await fetch(env.ENGINE_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-secret': env.ENGINE_SECRET
-        },
-        body: JSON.stringify({
-          r2_key: r2Key,
-          job_id: jobId
-        })
+      // Send job to queue for processing
+      await env.JOBS_QUEUE.send({
+        jobId,
+        accountId,
+        r2Key,
+        mode: 'general', // Default processing mode
+        webhook_url: null // No webhook for email-triggered jobs by default
       });
 
-      if (!engineResponse.ok) {
-        console.error(`Engine processing failed: ${engineResponse.status} ${engineResponse.statusText}`);
-        // Update job status to failed
-        await env.DB.prepare(`
-          UPDATE jobs SET status = ?, error = ?, updated_at = ?
-          WHERE id = ?
-        `).bind('failed', `Engine error: ${engineResponse.status}`, Date.now(), jobId).run();
-        return;
-      }
+      console.log(`Job queued: ${jobId} for account: ${accountId}`);
 
-      const structuredData = await engineResponse.json();
-
-      // Update job with extracted data
-      await env.DB.prepare(`
-        UPDATE jobs SET extracted_json = ?, status = ?, updated_at = ?
-        WHERE id = ?
-      `).bind(JSON.stringify(structuredData), 'pending', Date.now(), jobId).run();
-
-      await env.JOBS_QUEUE.send({ jobId, userId, r2Key, isDemo, originalSender: message.from });
-      
-      console.log(`Job queued: ${jobId}`);
-      
     } catch (error) {
       console.error('Email processing failed:', error);
     }
