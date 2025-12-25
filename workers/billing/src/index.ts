@@ -1,106 +1,135 @@
+import Stripe from 'stripe';
+
 export default {
   async fetch(request: Request, env: any) {
     const url = new URL(request.url);
-    
-    if (url.pathname === '/create-checkout') {
-      const { userId, plan } = await request.json();
-      
-      const productId = plan === 'pro' ? env.LEMON_PRO_PRODUCT_ID : env.LEMON_STARTER_PRODUCT_ID;
 
-      const checkout = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${env.LEMONSQEEZY_SECRET}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          store_id: env.LEMONSQEEZY_STORE_ID, // Assuming this exists as an env var
-          product_id: productId,
-          customer_email: userId,
-          custom_data: { userId }
-        })
+    if (url.pathname === '/create-checkout') {
+      const { account_id, plan } = await request.json();
+
+      // Create a Stripe instance
+      const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
+        apiVersion: '2023-10-16',
+        httpClient: Stripe.createFetchHttpClient(),
       });
-      
-      const checkoutData = await checkout.json();
-      return Response.redirect(checkoutData.data.attributes.url, 302);
+
+      try {
+        // Create a Stripe Checkout session
+        const session = await stripe.checkout.sessions.create({
+          mode: 'subscription',
+          customer_email: await getAccountEmail(env, account_id), // Get email for the account
+          line_items: [{
+            price: plan === 'pro' ? env.STRIPE_PRO_PRICE_ID : env.STRIPE_STARTER_PRICE_ID,
+            quantity: 1,
+          }],
+          success_url: `${env.APP_URL}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${env.APP_URL}/dashboard`,
+          metadata: {
+            account_id: account_id
+          }
+        });
+
+        // Return the checkout URL
+        return Response.redirect(session.url!, 303);
+      } catch (error) {
+        console.error('Stripe checkout session creation failed:', error);
+        return new Response('Failed to create checkout session', { status: 500 });
+      }
     }
-    
+
     if (url.pathname === '/webhook') {
-      const sig = request.headers.get('x-lemon-squeezy-signature');
+      const sig = request.headers.get('stripe-signature');
       const body = await request.text();
 
-      // Verify webhook signature
-      if (!sig) {
-        console.error('Missing signature header');
-        return new Response('Unauthorized', { status: 401 });
+      let event;
+
+      try {
+        // Verify webhook signature using Stripe's method
+        const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
+          apiVersion: '2023-10-16',
+          httpClient: Stripe.createFetchHttpClient(),
+        });
+
+        event = await stripe.webhooks.constructEventAsync(
+          body,
+          sig!,
+          env.STRIPE_WEBHOOK_SECRET,
+          undefined,
+          Stripe.createSubtleCryptoProvider()
+        );
+      } catch (err) {
+        console.error('Webhook signature verification failed:', err);
+        return new Response(`Webhook Error: ${err.message}`, { status: 400 });
       }
 
-      // Calculate HMAC of the request body using the secret
-      const encoder = new TextEncoder();
-      const keyBuffer = encoder.encode(env.LEMONSQEEZY_SECRET);
-      const key = await crypto.subtle.importKey(
-        'raw',
-        keyBuffer,
-        { name: 'HMAC', hash: 'SHA256' },
-        false,
-        ['sign']
-      );
-      const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(body));
-      const expectedSig = Array.from(new Uint8Array(signature))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+      // Handle the event
+      switch (event.type) {
+        case 'checkout.session.completed':
+          const session = event.data.object;
+          const accountId = session.metadata?.account_id;
 
-      if (sig !== expectedSig) {
-        console.error('Invalid signature');
-        return new Response('Unauthorized', { status: 401 });
+          if (accountId) {
+            // Add credits to the account after successful checkout
+            await addCreditsToAccount(env, accountId, session.metadata?.credits || 100);
+            console.log(`Added credits to account ${accountId} after checkout`);
+          }
+          break;
+
+        case 'customer.subscription.created':
+        case 'customer.subscription.updated':
+        case 'customer.subscription.deleted':
+          // Handle subscription changes
+          const subscription = event.data.object;
+          const subAccountId = subscription.metadata?.account_id;
+
+          if (subAccountId) {
+            // Update account subscription status
+            const status = subscription.status;
+            await updateAccountSubscription(env, subAccountId, status, subscription.id);
+            console.log(`Updated subscription for account ${subAccountId}, status: ${status}`);
+          }
+          break;
+
+        default:
+          console.log(`Unhandled event type: ${event.type}`);
       }
 
-      const webhookEvent = JSON.parse(body);
-
-      // Only handle specific event types
-      const validEvents = ['subscription_created', 'subscription_updated', 'subscription_cancelled'];
-      if (!validEvents.includes(webhookEvent.type)) {
-        console.log(`Unhandled event type: ${webhookEvent.type}`);
-        return new Response('OK');
-      }
-
-      // Verify custom_data exists and contains userId
-      if (!webhookEvent.data.custom_data || !webhookEvent.data.custom_data.userId) {
-        console.error('Missing userId in custom_data');
-        return new Response('Bad Request', { status: 400 });
-      }
-
-      const userId = webhookEvent.data.custom_data.userId;
-
-      // Determine plan based on product ID
-      const productId = webhookEvent.data.attributes.product_id;
-      let plan = null;
-
-      if (productId === env.LEMON_STARTER_PRODUCT_ID) {
-        plan = 'starter';
-      } else if (productId === env.LEMON_PRO_PRODUCT_ID) {
-        plan = 'pro';
-      } else {
-        console.error(`Unknown product ID: ${productId}`);
-        return new Response('OK'); // Don't fail for unknown products, just log
-      }
-
-      // Update user plan based on subscription status
-      let newPlan = plan;
-      if (webhookEvent.type === 'subscription_cancelled') {
-        // For cancelled subscriptions, downgrade to starter
-        newPlan = 'starter';
-      }
-
-      await env.DB.prepare(
-        `UPDATE users SET plan = ? WHERE id = ?`
-      ).bind(newPlan, userId).run();
-
-      console.log(`Updated user ${userId} plan to ${newPlan} for event ${webhookEvent.type}`);
-
-      return new Response('OK');
+      return new Response('OK', { status: 200 });
     }
-    
+
     return new Response('Not Found', { status: 404 });
   }
 };
+
+// Helper function to get account email
+async function getAccountEmail(env: any, accountId: string): Promise<string> {
+  const account = await env.DB.prepare(
+    'SELECT email FROM accounts WHERE id = ?'
+  ).bind(accountId).first();
+
+  return account?.email || '';
+}
+
+// Helper function to add credits to account
+async function addCreditsToAccount(env: any, accountId: string, credits: number) {
+  // In a real implementation, you would add credits based on the plan/tier
+  // For now, we'll just add a fixed amount
+  const creditAmount = credits || 100; // Default to 100 credits
+
+  await env.DB.prepare(`
+    UPDATE accounts
+    SET credits_balance = credits_balance + ?
+    WHERE id = ?
+  `).bind(creditAmount, accountId).run();
+}
+
+// Helper function to update account subscription
+async function updateAccountSubscription(env: any, accountId: string, status: string, subscriptionId: string) {
+  // Update account with subscription info
+  await env.DB.prepare(`
+    UPDATE accounts
+    SET stripe_customer_id = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).bind(subscriptionId, Date.now(), accountId).run();
+}
