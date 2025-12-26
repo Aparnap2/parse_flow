@@ -1,135 +1,72 @@
-import Stripe from 'stripe';
-
 export default {
   async fetch(request: Request, env: any) {
     const url = new URL(request.url);
 
     if (url.pathname === '/create-checkout') {
-      const { account_id, plan } = await request.json();
-
-      // Create a Stripe instance
-      const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
-        apiVersion: '2023-10-16',
-        httpClient: Stripe.createFetchHttpClient(),
-      });
+      const { user_id, plan } = await request.json();
 
       try {
-        // Create a Stripe Checkout session
-        const session = await stripe.checkout.sessions.create({
-          mode: 'subscription',
-          customer_email: await getAccountEmail(env, account_id), // Get email for the account
-          line_items: [{
-            price: plan === 'pro' ? env.STRIPE_PRO_PRICE_ID : env.STRIPE_STARTER_PRICE_ID,
-            quantity: 1,
-          }],
-          success_url: `${env.APP_URL}/dashboard?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${env.APP_URL}/dashboard`,
-          metadata: {
-            account_id: account_id
-          }
-        });
+        // Create a Lemon Squeezy checkout URL
+        // This is a simplified approach - in a real implementation you'd use the Lemon Squeezy API
+        const checkoutUrl = `${env.LEMONSQUEEZY_STORE_URL}/checkout/buy/${env.LEMONSQUEEZY_PRODUCT_VARIANT_ID}?embed=1&checkout[email]=${await getUserEmail(env, user_id)}`;
 
         // Return the checkout URL
-        return Response.redirect(session.url!, 303);
+        return Response.redirect(checkoutUrl, 303);
       } catch (error) {
-        console.error('Stripe checkout session creation failed:', error);
+        console.error('Lemon Squeezy checkout creation failed:', error);
         return new Response('Failed to create checkout session', { status: 500 });
       }
-    }
-
-    if (url.pathname === '/webhook') {
-      const sig = request.headers.get('stripe-signature');
-      const body = await request.text();
-
-      let event;
-
-      try {
-        // Verify webhook signature using Stripe's method
-        const stripe = new Stripe(env.STRIPE_SECRET_KEY, {
-          apiVersion: '2023-10-16',
-          httpClient: Stripe.createFetchHttpClient(),
-        });
-
-        event = await stripe.webhooks.constructEventAsync(
-          body,
-          sig!,
-          env.STRIPE_WEBHOOK_SECRET,
-          undefined,
-          Stripe.createSubtleCryptoProvider()
-        );
-      } catch (err) {
-        console.error('Webhook signature verification failed:', err);
-        return new Response(`Webhook Error: ${err.message}`, { status: 400 });
-      }
-
-      // Handle the event
-      switch (event.type) {
-        case 'checkout.session.completed':
-          const session = event.data.object;
-          const accountId = session.metadata?.account_id;
-
-          if (accountId) {
-            // Add credits to the account after successful checkout
-            await addCreditsToAccount(env, accountId, session.metadata?.credits || 100);
-            console.log(`Added credits to account ${accountId} after checkout`);
-          }
-          break;
-
-        case 'customer.subscription.created':
-        case 'customer.subscription.updated':
-        case 'customer.subscription.deleted':
-          // Handle subscription changes
-          const subscription = event.data.object;
-          const subAccountId = subscription.metadata?.account_id;
-
-          if (subAccountId) {
-            // Update account subscription status
-            const status = subscription.status;
-            await updateAccountSubscription(env, subAccountId, status, subscription.id);
-            console.log(`Updated subscription for account ${subAccountId}, status: ${status}`);
-          }
-          break;
-
-        default:
-          console.log(`Unhandled event type: ${event.type}`);
-      }
-
-      return new Response('OK', { status: 200 });
     }
 
     return new Response('Not Found', { status: 404 });
   }
 };
 
-// Helper function to get account email
-async function getAccountEmail(env: any, accountId: string): Promise<string> {
-  const account = await env.DB.prepare(
-    'SELECT email FROM accounts WHERE id = ?'
-  ).bind(accountId).first();
+// Helper function to get user email
+async function getUserEmail(env: any, userId: string): Promise<string> {
+  const user = await env.DB.prepare(
+    'SELECT email FROM users WHERE id = ?'
+  ).bind(userId).first();
 
-  return account?.email || '';
+  return user?.email || '';
 }
 
-// Helper function to add credits to account
-async function addCreditsToAccount(env: any, accountId: string, credits: number) {
-  // In a real implementation, you would add credits based on the plan/tier
-  // For now, we'll just add a fixed amount
-  const creditAmount = credits || 100; // Default to 100 credits
+// Function to report usage to Lemon Squeezy
+export async function reportUsage(env: any, subscription_item_id: string, quantity: number) {
+  const LS_API_KEY = env.LEMONSQUEEZY_API_KEY;
 
-  await env.DB.prepare(`
-    UPDATE accounts
-    SET credits_balance = credits_balance + ?
-    WHERE id = ?
-  `).bind(creditAmount, accountId).run();
-}
+  try {
+    const response = await fetch('https://api.lemonsqueezy.com/v1/usage-records', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${LS_API_KEY}`,
+        'Content-Type': 'application/vnd.api+json'
+      },
+      body: JSON.stringify({
+        data: {
+          type: 'usage-records',
+          attributes: {
+            quantity: quantity,
+            action: 'increment'
+          },
+          relationships: {
+            'subscription-item': {
+              data: {
+                type: 'subscription-items',
+                id: subscription_item_id
+              }
+            }
+          }
+        }
+      })
+    });
 
-// Helper function to update account subscription
-async function updateAccountSubscription(env: any, accountId: string, status: string, subscriptionId: string) {
-  // Update account with subscription info
-  await env.DB.prepare(`
-    UPDATE accounts
-    SET stripe_customer_id = ?,
-        updated_at = ?
-    WHERE id = ?
-  `).bind(subscriptionId, Date.now(), accountId).run();
+    if (!response.ok) {
+      console.error('Failed to report usage to Lemon Squeezy:', await response.text());
+    } else {
+      console.log('Successfully reported usage to Lemon Squeezy');
+    }
+  } catch (error) {
+    console.error('Error reporting usage to Lemon Squeezy:', error);
+  }
 }

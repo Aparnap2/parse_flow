@@ -3,6 +3,14 @@ import PostalMime from 'postal-mime';
 export default {
   async email(message: any, env: any, ctx: any) {
     try {
+      // Rate limiting to prevent infinite loops
+      const ip = message.headers.get("x-real-ip") || "unknown";
+      const { success } = await env.MY_RATE_LIMITER.limit({ key: ip });
+      if (!success) {
+        console.log("Rate limit exceeded for", ip);
+        return; // Drop silently to save costs
+      }
+
       const raw = await new Response(message.raw as ReadableStream).arrayBuffer();
       const parser = new PostalMime();
       const email = await parser.parse(raw as ArrayBuffer);
@@ -13,58 +21,82 @@ export default {
 
       if (!attachment) {
         console.log('No PDF attachment, skipping');
+        // Send an "Oops" email to the sender
+        try {
+          await sendOopsEmail(message.from, "No PDF attachment found in your email. Please attach a PDF file.");
+        } catch (emailError) {
+          console.error('Failed to send oops email:', emailError);
+        }
         return;
       }
 
       const recipient = message.to[0].address;
 
-      // For ParseFlow, we need to identify the account based on the email or other means
-      // For now, we'll use a simplified approach - in a real system this would be more sophisticated
-      let accountId;
+      // Find user based on the inbox alias (recipient email)
+      const user = await env.DB.prepare(
+        'SELECT id FROM users WHERE inbox_alias = ?'
+      ).bind(recipient).first();
 
-      // Check if this is a demo email address
-      const isDemo = recipient === 'demo@parseflow.ai';
-
-      if (isDemo) {
-        // For demo, we might use a special demo account
-        // In a real implementation, you'd have proper account identification
-        accountId = 'demo_account_id'; // This is a placeholder
-      } else {
-        // In a real system, you would identify the account based on:
-        // 1. The email domain (if using account-specific domains)
-        // 2. A lookup table mapping emails to accounts
-        // 3. API key passed in email headers
-        // For now, we'll use a placeholder approach
-        accountId = `account_for_${recipient.replace(/[^a-zA-Z0-9]/g, '_')}`;
+      if (!user) {
+        console.log(`No user found for inbox alias: ${recipient}`);
+        return;
       }
 
-      // Store document in R2 with account-specific path
-      const r2Key = `uploads/${accountId}/${Date.now()}.pdf`;
+      // Find the user's default blueprint
+      const blueprint = await env.DB.prepare(
+        'SELECT id, schema_json FROM blueprints WHERE user_id = ? LIMIT 1'
+      ).bind(user.id).first();
+
+      if (!blueprint) {
+        console.log(`No blueprint found for user: ${user.id}`);
+        // Send an email to the user asking them to create a blueprint
+        try {
+          await sendOopsEmail(message.from, "You need to create an extraction blueprint before I can process your documents. Please log in to your dashboard and create a blueprint.");
+        } catch (emailError) {
+          console.error('Failed to send blueprint request email:', emailError);
+        }
+        return;
+      }
+
+      // Store document in R2 with user-specific path
+      const r2Key = `uploads/${user.id}/${Date.now()}.pdf`;
       await env.R2.put(r2Key, attachment.content, {
         httpMetadata: { contentType: attachment.contentType }
       });
 
       const jobId = crypto.randomUUID();
 
-      // Insert initial job record using the ParseFlow schema
+      // Insert initial job record using the Sarah AI schema
       await env.DB.prepare(`
-        INSERT INTO jobs (id, account_id, input_key, status, created_at)
+        INSERT INTO jobs (id, user_id, r2_key, status, created_at)
         VALUES (?, ?, ?, 'queued', ?)
-      `).bind(jobId, accountId, r2Key, Date.now()).run();
+      `).bind(jobId, user.id, r2Key, Date.now()).run();
 
       // Send job to queue for processing
       await env.JOBS_QUEUE.send({
         jobId,
-        accountId,
+        userId: user.id,
         r2Key,
-        mode: 'general', // Default processing mode
-        webhook_url: null // No webhook for email-triggered jobs by default
+        blueprintId: blueprint.id,
+        schema_json: blueprint.schema_json
       });
 
-      console.log(`Job queued: ${jobId} for account: ${accountId}`);
+      console.log(`Job queued: ${jobId} for user: ${user.id} with blueprint: ${blueprint.id}`);
 
     } catch (error) {
       console.error('Email processing failed:', error);
+      // Send an "Oops" email to the sender if possible
+      try {
+        await sendOopsEmail(message.from, "I had trouble reading the PDF you sent. Is it password protected or corrupted?");
+      } catch (emailError) {
+        console.error('Failed to send oops email:', emailError);
+      }
     }
   }
 };
+
+// Helper function to send "Oops" emails
+async function sendOopsEmail(to: string, message: string) {
+  // This is a placeholder - in a real implementation you would use an email service
+  console.log(`Would send email to: ${to} with message: ${message}`);
+}

@@ -1,12 +1,15 @@
-name = "structurize-billing"
+name = "sarah-ai-billing"
 main = "src/index.ts"
 compatibility_date = "2025-12-22"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "structurize-db"
-database_id = "YOUR_D1_ID"
+database_name = "sarah-ai-db"
+database_id = "YOUR_D1_DATABASE_ID"
 
 [vars]
-LEMONSQEEZY_SECRET = "your_lemonsqueezy_secret"
-BASE_URL = "https://structurize.ai"
+LEMONSQUEEZY_API_KEY = "your_lemonsqueezy_api_key"
+LEMONSQUEEZY_WEBHOOK_SECRET = "your_lemonsqueezy_webhook_secret"
+LEMONSQUEEZY_STORE_URL = "your_lemonsqueezy_store_url"
+LEMONSQUEEZY_PRODUCT_VARIANT_ID = "your_product_variant_id"
+BASE_URL = "https://sarah.ai"

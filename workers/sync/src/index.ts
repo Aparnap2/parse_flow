@@ -4,13 +4,13 @@ export default {
 
     for (const message of batch.messages) {
       try {
-        const { jobId, accountId, r2Key, mode = 'general', webhook_url } = message.body;
+        const { jobId, userId, r2Key, blueprintId, schema_json } = message.body;
 
-        console.log(`Processing job ${jobId} for account ${accountId}, attempt ${message.attempts}, mode: ${mode}`);
+        console.log(`Processing job ${jobId} for user ${userId}, attempt ${message.attempts}, blueprint: ${blueprintId}`);
 
         // Fetch job details from the database
         const job = await env.DB.prepare(`
-          SELECT id, account_id, status, mode, input_key, output_key, webhook_url, trust_score, error_message, created_at, completed_at
+          SELECT id, user_id, status, r2_key, result_json, confidence, created_at, completed_at
           FROM jobs
           WHERE id = ?
         `).bind(jobId).first();
@@ -21,7 +21,7 @@ export default {
           continue;
         }
 
-        // Call the processing engine to handle the document
+        // Call the processing engine to handle the document with the user's schema
         const engineResponse = await fetch(env.ENGINE_URL, {
           method: 'POST',
           headers: {
@@ -31,7 +31,7 @@ export default {
           body: JSON.stringify({
             r2_key: r2Key,
             job_id: jobId,
-            mode: mode
+            schema_json: schema_json // Pass the user-defined schema
           })
         });
 
@@ -39,71 +39,61 @@ export default {
           console.error(`Engine processing failed: ${engineResponse.status} ${engineResponse.statusText}`);
           // Update job status to failed
           await env.DB.prepare(`
-            UPDATE jobs SET status = ?, error_message = ?, completed_at = ?
+            UPDATE jobs SET status = ?, completed_at = ?
             WHERE id = ?
-          `).bind('failed', `Engine error: ${engineResponse.status}`, Date.now(), jobId).run();
-          
-          // If we have a webhook URL, notify the user of the failure
-          if (webhook_url) {
-            try {
-              await fetch(webhook_url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  id: jobId,
-                  status: 'failed',
-                  error: `Engine error: ${engineResponse.status}`
-                })
-              });
-            } catch (webhookError) {
-              console.error(`Failed to send webhook notification:`, webhookError);
-            }
-          }
-          
+          `).bind('failed', Date.now(), jobId).run();
+
           message.ack();
           continue;
         }
 
         const result = await engineResponse.json();
-        
+
+        // Determine the status based on confidence level
+        // If confidence is low, set status to 'review' for HITL
+        let status = 'completed';
+        if (result.confidence < 0.8) { // Threshold for requiring review
+          status = 'review';
+        }
+
         // Update job with the processing results
         await env.DB.prepare(`
-          UPDATE jobs 
-          SET status = ?, output_key = ?, trust_score = ?, completed_at = ?
+          UPDATE jobs
+          SET status = ?, result_json = ?, confidence = ?, completed_at = ?
           WHERE id = ?
         `).bind(
-          result.status || 'completed',
-          result.output_key,
-          result.trust_score,
+          status,
+          JSON.stringify(result.result),
+          result.confidence,
           Date.now(),
           jobId
         ).run();
 
-        // If the job has a webhook URL, send the result
-        if (webhook_url) {
-          try {
-            await fetch(webhook_url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                id: jobId,
-                status: result.status || 'completed',
-                result_url: `${env.R2_PUBLIC_URL}/${result.output_key}`,
-                trust_score: result.trust_score
-              })
-            });
-            console.log(`Webhook sent for job ${jobId}`);
-          } catch (webhookError) {
-            console.error(`Failed to send webhook for job ${jobId}:`, webhookError);
-            // Don't fail the job if webhook sending fails, just log the error
-          }
+        // Send completion notification to the main API
+        try {
+          await fetch(`${env.API_URL}/webhook/internal/complete`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-internal-secret': env.WORKER_API_SECRET
+            },
+            body: JSON.stringify({
+              job_id: jobId,
+              status: status,
+              result: result.result,
+              confidence: result.confidence
+            })
+          });
+          console.log(`Internal callback sent for job ${jobId}`);
+        } catch (callbackError) {
+          console.error(`Failed to send internal callback for job ${jobId}:`, callbackError);
         }
 
         message.ack();
         console.log(`Successfully processed job ${jobId}`);
 
       } catch (error) {
-        console.error(`Sync failed for job ${jobId}, account ${accountId}, attempt ${message.attempts}:`, error);
+        console.error(`Sync failed for job ${jobId}, user ${userId}, attempt ${message.attempts}:`, error);
 
         // Check if we've exceeded max retry attempts
         if (message.attempts >= MAX_RETRY_ATTEMPTS) {
@@ -113,9 +103,9 @@ export default {
             // Update job status to 'failed' in the database
             await env.DB.prepare(`
               UPDATE jobs SET
-                status = ?, error_message = ?, completed_at = ?
+                status = ?, completed_at = ?
               WHERE id = ?
-            `).bind('failed', `Max retries exceeded: ${error.message || 'Unknown error'}`, Date.now(), message.body.jobId).run();
+            `).bind('failed', Date.now(), message.body.jobId).run();
           } catch (updateError) {
             console.error(`Failed to update job status to 'failed' for job ${message.body.jobId}:`, updateError);
           }

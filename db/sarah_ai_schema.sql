@@ -28,8 +28,7 @@ CREATE TABLE jobs (
   r2_key TEXT,
   result_json TEXT, -- Extracted Data
   confidence REAL,
-  created_at INTEGER,
-  completed_at INTEGER
+  created_at INTEGER
 );
 
 -- Performance Indexing
