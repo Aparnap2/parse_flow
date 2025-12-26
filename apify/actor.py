@@ -3,6 +3,7 @@ Apify Actor for Sarah AI - Invoice Processing
 
 This actor processes invoices using DeepSeek OCR and Granite Docling models
 with schema-based extraction and validation capabilities.
+Uses Ollama models for local processing instead of OpenAI.
 """
 
 import os
@@ -18,6 +19,21 @@ import asyncio
 import aiohttp
 import re
 from datetime import datetime
+from openai import OpenAI  # For Ollama compatibility
+import json
+
+# Initialize client using environment variables (can be set to Ollama or OpenAI)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")  # Default to Ollama
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")  # Default to Ollama dummy key
+EXTRACTION_MODEL = os.getenv("EXTRACTION_MODEL", "ministral-3:3b")  # Default to local model
+
+client = OpenAI(
+    base_url=OPENAI_BASE_URL,
+    api_key=OPENAI_API_KEY
+)
+
+# Document processing models (using ONNX for efficiency)
+DOCLING_MODEL = os.getenv("DOCLING_MODEL", "ibm/granite-docling:latest")
 
 # 1. Define the Strict Output Schema (Pydantic)
 class InvoiceLineItem(BaseModel):
@@ -47,8 +63,8 @@ class AgentState(TypedDict):
 class OCRProcessor:
     def __init__(self, ollama_endpoint: str = "http://localhost:11434"):
         self.ollama_endpoint = ollama_endpoint
-        self.deepseek_model = "deepseek-ocr:3b"
-        self.docling_model = "ibm/granite-docling:latest"
+        # Using only Docling for document processing (more efficient than OCR)
+        self.docling_model = os.getenv("DOCLING_MODEL", "ibm/granite-docling:latest")
     
     def _encode_image(self, image_path: str) -> str:
         """Encode image to base64 for API requests"""
@@ -105,12 +121,6 @@ class OCRProcessor:
         """Extract text from PDF using Granite Docling"""
         prompt = "Convert this document to markdown format preserving structure, tables, and text content. Focus on accuracy and layout preservation. Respond only with the markdown content."
         result = await self._call_ollama(session, self.docling_model, prompt, pdf_path)
-        return result
-    
-    async def extract_with_deepseek_ocr(self, session, pdf_path: str) -> str:
-        """Extract text from PDF using DeepSeek OCR"""
-        prompt = "<image>\n<|grounding|>Convert the document to markdown. Pay special attention to tables, figures, and financial details. Preserve layout and structure for accurate analysis. Respond only with the extracted content."
-        result = await self._call_ollama(session, self.deepseek_model, prompt, pdf_path)
         return result
     
     def extract_according_to_schema(self, text_content: str, ocr_content: str, schema: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -268,42 +278,38 @@ class OCRProcessor:
         return f"No text found for: {field_name}"
 
 def parse_pdf_node(state: AgentState) -> Dict[str, Any]:
-    """Downloads and OCRs the PDF using DeepSeek/Docling"""
+    """Downloads and processes the PDF using Docling"""
     import asyncio
-    
+
     async def process_pdf():
         processor = OCRProcessor()
-        
+
         # Download the PDF
         pdf_path = await processor.download_pdf(state['pdf_url'])
-        
+
         try:
             async with aiohttp.ClientSession() as session:
-                # Extract text with Docling
+                # Extract text with Docling (efficient ONNX-based processing)
                 text_content = await processor.extract_text_with_docling(session, pdf_path)
-                
-                # Extract with DeepSeek OCR
-                ocr_content = await processor.extract_with_deepseek_ocr(session, pdf_path)
-                
-                # Extract according to user schema
+
+                # Extract according to user schema using only Docling output
                 user_schema = state.get('user_schema', [])
                 extracted_fields = processor.extract_according_to_schema(
-                    text_content, 
-                    ocr_content, 
+                    text_content,
+                    text_content,  # Using same content for both params since we only have one source now
                     user_schema
                 )
-                
+
                 # Calculate a simple confidence based on how many fields were found
                 found_fields = sum(1 for v in extracted_fields.values() if not v.startswith("No "))
                 total_fields = len(extracted_fields)
                 confidence = found_fields / total_fields if total_fields > 0 else 0.0
-                
+
                 return {
-                    "extracted_text": f"Text: {text_content}\nOCR: {ocr_content}",
+                    "extracted_text": text_content,  # Just the Docling output
                     "structured_data": {
                         "extracted_fields": extracted_fields,
-                        "raw_text": text_content,
-                        "raw_ocr": ocr_content
+                        "raw_text": text_content
                     },
                     "confidence": confidence
                 }
@@ -312,7 +318,7 @@ def parse_pdf_node(state: AgentState) -> Dict[str, Any]:
             import os
             if os.path.exists(pdf_path):
                 os.unlink(pdf_path)
-    
+
     # Run the async function
     import nest_asyncio
     nest_asyncio.apply()
@@ -320,7 +326,7 @@ def parse_pdf_node(state: AgentState) -> Dict[str, Any]:
     asyncio.set_event_loop(loop)
     result = loop.run_until_complete(process_pdf())
     loop.close()
-    
+
     return result
 
 def extract_data_node(state: AgentState) -> Dict[str, Any]:
